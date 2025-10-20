@@ -1,106 +1,135 @@
-import json, os, re, time, random
+import json, os, random, re, time, traceback
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 import requests
-from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
+from dotenv import load_dotenv
 
+# ── Load .env in dev; Railway uses Variables tab
 load_dotenv()
 
-# === CONFIG ===
-SHEIN_URL   = os.getenv("SHEIN_URL", "https://www.sheinindia.in/c/sverse-5939-37961")
-BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID")
-CACHE_PATH  = Path("seen.json")
-CHECK_EVERY = int(os.getenv("CHECK_EVERY", "600"))
-ALERT_MODE  = os.getenv("ALERT_MODE", "new_only").lower()  # new_only | restock | any_instock
-VERBOSE     = os.getenv("VERBOSE", "0") == "1"
+# ── Config
+SHEIN_URL = os.getenv("SHEIN_URL", "https://www.sheinindia.in/c/sverse-5939-37961")
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")  # optional; we’ll reply to any user who presses buttons too
+CACHE_PATH = Path("seen.json")
+ALERT_MODE = os.getenv("ALERT_MODE", "new_only")  # "new_only" = alert only brand-new + in-stock
+SCAN_INTERVAL_MIN = int(os.getenv("SCAN_INTERVAL_MIN", "15"))
 
+# Optional proxy for Playwright (HIGHLY RECOMMENDED for Shein India)
+PROXY_SERVER = os.getenv("PROXY_SERVER")          # e.g. "http://219.65.73.81:8080"
+PROXY_USERNAME = os.getenv("PROXY_USERNAME")
+PROXY_PASSWORD = os.getenv("PROXY_PASSWORD")
+
+# Keywords that usually mean "out of stock"
 OOS_PATTERNS = [r"out\s*of\s*stock", r"sold\s*out", r"unavailable", r"notify\s*me"]
 
-# ----------------- Telegram helpers -----------------
-def tg(method, **data):
-    if not BOT_TOKEN: return {}
+# ── Telegram endpoints
+TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else None
+
+# ── Simple helpers
+def send_telegram(text: str, chat_id: str | None = None, reply_markup: dict | None = None):
+    if not TG_API:
+        print("Missing TELEGRAM_BOT_TOKEN")
+        return
+    if not chat_id:
+        chat_id = CHAT_ID
+    if not chat_id:
+        print("Missing TELEGRAM_CHAT_ID and no chat_id provided")
+        return
+
+    payload = {
+        "chat_id": chat_id,
+        "text": text[:4096],
+        "disable_web_page_preview": True,
+        "parse_mode": "HTML",
+    }
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
+
     try:
-        r = requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/{method}", json=data, timeout=25)
-        return r.json()
+        r = requests.post(f"{TG_API}/sendMessage", data=payload, timeout=20)
+        if r.status_code >= 400:
+            print("Telegram send error:", r.text)
     except Exception as e:
-        print("[warn] telegram:", e); return {}
+        print("Telegram error:", e)
 
-def send_text(chat_id, text, reply_markup=None):
-    if not BOT_TOKEN or not chat_id: return
-    tg("sendMessage", chat_id=chat_id, text=text, disable_web_page_preview=True, reply_markup=reply_markup)
+def answer_callback(cb_id: str, text: str = ""):
+    if not TG_API: return
+    try:
+        requests.post(f"{TG_API}/answerCallbackQuery", data={"callback_query_id": cb_id, "text": text[:200]}, timeout=15)
+    except Exception:
+        pass
 
-def answer_cbq(cid, text=""): 
-    if cid: tg("answerCallbackQuery", callback_query_id=cid, text=text)
+def send_menu(chat_id: str | None = None):
+    kb = {
+        "inline_keyboard": [
+            [{"text": "🔍 Check stock", "callback_data": "check"}],
+            [{"text": "🔄 Refresh (clear cache + rescan)", "callback_data": "refresh"}],
+        ]
+    }
+    send_telegram("Choose an action:", chat_id=chat_id, reply_markup=kb)
 
-def menu_markup():
-    return {"inline_keyboard":[
-        [{"text":"🔎 Check stock","callback_data":"check"},
-         {"text":"🔄 Refresh","callback_data":"refresh"}]
-    ]}
+def tg_get_updates(offset: int | None):
+    if not TG_API:
+        return []
+    params = {"timeout": 25}
+    if offset is not None:
+        params["offset"] = offset
+    try:
+        r = requests.get(f"{TG_API}/getUpdates", params=params, timeout=30)
+        data = r.json()
+        return data.get("result", [])
+    except Exception as e:
+        print("getUpdates error:", e)
+        return []
 
-# ----------------- Cache -----------------
+# ── Cache
 def load_cache():
     if CACHE_PATH.exists():
-        try: return json.loads(CACHE_PATH.read_text(encoding="utf-8"))
-        except Exception: return {}
+        try:
+            return json.loads(CACHE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
     return {}
 
-def save_cache(c): CACHE_PATH.write_text(json.dumps(c, indent=2, ensure_ascii=False), encoding="utf-8")
+def save_cache(cache):
+    CACHE_PATH.write_text(json.dumps(cache, indent=2, ensure_ascii=False), encoding="utf-8")
 
-# ----------------- Utils -----------------
 def is_oos(text: str) -> bool:
-    t = (text or "").lower()
-    return any(re.search(p, t) for p in OOS_PATTERNS)
+    t = (text or "").strip().lower()
+    for pat in OOS_PATTERNS:
+        if re.search(pat, t):
+            return True
+    return False
 
-def extract_id(href, title):
-    if href:
-        p = urlparse(href).path
-        m = re.search(r"(\d{6,})", p)
-        if m: return m.group(1)
-        return p.strip("/")[:200]
-    return (title or "unknown")[:200]
-
-def summarize_instock(items):
-    inst = [i for i in items if i["in_stock"]]
-    if not inst:
-        return "No items are in stock right now."
-    lines = ["🟢 In-stock items:"]
-    for i in inst[:30]:
-        lines.append(f"• {i['title']}\n{i['href']}")
-    if len(inst) > 30:
-        lines.append(f"...and {len(inst)-30} more.")
-    return "\n".join(lines)
-
-def decide_alerts(prev, cur):
-    alerts=[]
-    if ALERT_MODE == "new_only":
-        for k,v in cur.items():
-            if v["in_stock"] and k not in prev: alerts.append(v)
-    elif ALERT_MODE == "restock":
-        for k,v in cur.items():
-            was = prev.get(k, {"in_stock": False})
-            if v["in_stock"] and not was.get("in_stock", False): alerts.append(v)
-    else:  # any_instock
-        alerts = [v for v in cur.values() if v["in_stock"]]
-    return alerts
-
-# ----------------- Scraper (JSON-first, DOM-fallback) -----------------
-def scrape_once():
+# ── Core scraping with Playwright
+def scrape_once(debug_screenshot: str = "debug.png"):
     """
-    Returns list of dicts: [{id, title, href, in_stock}]
+    Returns list of dicts:
+      [{"id": "...", "title": "...", "href": "...", "oos": True/False}]
+    Saves a debug screenshot on failure/block for inspection.
     """
     results = []
-    json_products = []
+
+    # Build proxy dict for Playwright if present
+    proxy = None
+    if PROXY_SERVER:
+        proxy = {"server": PROXY_SERVER}
+        if PROXY_USERNAME and PROXY_PASSWORD:
+            proxy["username"] = PROXY_USERNAME
+            proxy["password"] = PROXY_PASSWORD
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
+            proxy=proxy,
             args=[
-                "--no-sandbox","--disable-gpu","--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
                 "--disable-blink-features=AutomationControlled",
-                "--disable-features=IsolateOrigins,site-per-process"
+                "--disable-features=IsolateOrigins,site-per-process",
             ],
         )
 
@@ -112,224 +141,255 @@ def scrape_once():
                         "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"),
             extra_http_headers={
                 "Accept-Language": "en-IN,en;q=0.9",
-                "Sec-Fetch-Site": "same-origin",
-                "Sec-Fetch-Mode": "navigate",
-                "Sec-Fetch-Dest": "document",
-                "Upgrade-Insecure-Requests": "1",
             },
         )
-
-        # Pre-set region/currency cookies so the site serves India catalog immediately
-        try:
-            context.add_cookies([
-                {"name":"region","value":"IN","domain":".sheinindia.in","path":"/"},
-                {"name":"local_country","value":"IN","domain":".sheinindia.in","path":"/"},
-                {"name":"currency","value":"INR","domain":".sheinindia.in","path":"/"},
-            ])
-        except Exception: pass
-
         page = context.new_page()
-        page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
-
-        # Capture JSON data requests the SPA makes
-        api_json_blobs = []
-        def on_response(resp):
-            ct = (resp.headers.get("content-type") or "").lower()
-            url = resp.url
-            # many shein category/search endpoints include 'list', 'goods', 'search', 'products'
-            if "application/json" in ct and any(k in url for k in ["list","goods","search","product"]):
+        try:
+            time.sleep(random.uniform(1.0, 2.0))
+            page.goto(SHEIN_URL, wait_until="domcontentloaded", timeout=60000)
+            # If the page is an Akamai/Access Denied, bail after screenshot
+            body_text = (page.inner_text("body") or "").lower()
+            if "access denied" in body_text or "permission to access" in body_text:
                 try:
-                    data = resp.json()
-                    api_json_blobs.append({"url": url, "json": data})
-                except:
+                    page.screenshot(path=debug_screenshot, full_page=True)
+                except Exception:
                     pass
-        page.on("response", on_response)
+                print("[debug] Access denied page detected")
+                return []
 
-        page.goto(SHEIN_URL, wait_until="domcontentloaded", timeout=90000)
+            # Let lazy content settle
+            page.wait_for_load_state("networkidle", timeout=90000)
 
-        # Try to close/accept cookie or region gate if shown
-        for sel in [
-            'button:has-text("Accept")', 'button:has-text("I agree")',
-            'button:has-text("Agree")', 'button:has-text("OK")',
-            '[data-testid="accept-all"]', '.c-cookie-accept', '.cookie-accept',
-        ]:
-            try:
-                if page.locator(sel).first.count() > 0:
-                    page.locator(sel).first.click(timeout=1000)
-                    break
-            except: pass
-
-        # Wait for network calm then scroll to trigger more requests
-        page.wait_for_load_state("networkidle", timeout=120000)
-
-        last_h = 0
-        for _ in range(24):   # ~ deep enough, API path triggers early anyway
-            page.evaluate("window.scrollBy(0, document.body.scrollHeight)")
-            time.sleep(1.2)
-            h = page.evaluate("() => document.body.scrollHeight")
-            if h == last_h: break
-            last_h = h
-
-        # If we caught any JSON, parse it for products
-        def harvest_from_json():
-            items=[]
-            for blob in api_json_blobs:
-                data = blob["json"]
-                # look for common fields: 'goods', 'products', 'list', 'items'
-                for key in ["goods","products","list","items","data"]:
-                    arr = data.get(key) if isinstance(data, dict) else None
-                    if isinstance(arr, list) and arr:
-                        for it in arr:
-                            title = str(it.get("goods_name") or it.get("title") or it.get("name") or "Unknown").strip()
-                            href  = it.get("goods_url") or it.get("url") or it.get("detail_url")
-                            gid   = str(it.get("goods_id") or it.get("id") or extract_id(href, title))
-                            # Try stock signals
-                            in_stock = True
-                            if isinstance(it.get("sold_out"), bool):
-                                in_stock = not it["sold_out"]
-                            elif "stock" in it and isinstance(it["stock"], int):
-                                in_stock = it["stock"] > 0
-                            elif "status" in it and isinstance(it["status"], str):
-                                in_stock = not is_oos(it["status"])
-                            items.append({"id": gid, "title": title, "href": href or SHEIN_URL, "in_stock": in_stock})
-                        # don’t double-count
-            return items
-
-        json_products = harvest_from_json()
-
-        # Fallback to DOM if JSON wasn’t captured (or empty)
-        if not json_products:
+            # Heuristic selectors (DOM may change over time)
             cards = page.locator(
-                '[data-sqin="product-card"], .product-card, .S-product-item, '
-                '.S-product-item__wrapper, [class*="product"] article, a[href*="/product/"]'
-            ).all()
+                '[data-sqin="product-card"], .product-card, [class*="product"] article, a[href*="/product/"]'
+            )
 
-            seen=set()
-            for el in cards:
+            # Scroll & load a bit to improve capture
+            try:
+                for _ in range(3):
+                    page.mouse.wheel(0, 1200)
+                    time.sleep(0.75)
+            except Exception:
+                pass
+
+            elements = cards.all()
+            seen_ids = set()
+
+            for el in elements:
                 try:
                     href = el.get_attribute("href")
                     if not href:
-                        a = el.locator("a").first
-                        if a and a.count()>0:
-                            href = a.get_attribute("href")
+                        link_el = el.locator("a").first
+                        if link_el and link_el.count() > 0:
+                            href = link_el.get_attribute("href")
                     if href and href.startswith("/"):
                         href = urljoin(SHEIN_URL, href)
 
-                    title=None
-                    for s in ['[title]','.product-title','[class*="title"]','a[title]','a']:
+                    title = None
+                    for sel in ['[title]', '.product-title', '[class*="title"]', "a"]:
                         try:
-                            c=el.locator(s).first
-                            if c and c.count()>0:
-                                val = c.get_attribute("title") or c.inner_text(timeout=800)
-                                if val and len(val.strip())>1:
-                                    title=" ".join(val.strip().split()); break
-                        except: pass
+                            cand = el.locator(sel).first
+                            if cand and cand.count() > 0:
+                                val = cand.get_attribute("title") or cand.inner_text(timeout=800)
+                                if val and len(val.strip()) > 1:
+                                    title = " ".join(val.strip().split())
+                                    break
+                        except Exception:
+                            pass
 
-                    all_txt=""
-                    try: all_txt = el.inner_text(timeout=800)
-                    except: pass
+                    badge_text = ""
+                    for bsel in ['[class*="badge"]', '[class*="oos"]', '[class*="sold"]',
+                                 'text=Sold Out', 'text=Out of stock', '[class*="stock"]']:
+                        try:
+                            b = el.locator(bsel).first
+                            if b and b.count() > 0:
+                                badge_text = (b.inner_text(timeout=600) or "").strip()
+                                if badge_text:
+                                    break
+                        except Exception:
+                            pass
 
-                    pid = extract_id(href, title)
-                    if pid and pid not in seen:
-                        seen.add(pid)
-                        json_products.append({
+                    all_text = ""
+                    try:
+                        all_text = el.inner_text(timeout=800)
+                    except Exception:
+                        pass
+
+                    oos_flag = is_oos(badge_text or all_text)
+                    pid = (href or (title or "")).strip()[:300]
+                    if pid and pid not in seen_ids:
+                        seen_ids.add(pid)
+                        results.append({
                             "id": pid,
-                            "title": title or "Unknown",
+                            "title": title or "Unknown item",
                             "href": href or SHEIN_URL,
-                            "in_stock": not is_oos(all_txt),
+                            "oos": oos_flag
                         })
-                except: 
+                except Exception:
                     continue
 
-        if VERBOSE:
-            page.screenshot(path="debug.png", full_page=True)
-            print(f"[debug] saved debug.png  blobs={len(api_json_blobs)} products={len(json_products)}")
+            # Screenshot for debugging success state too
+            try:
+                page.screenshot(path=debug_screenshot, full_page=True)
+            except Exception:
+                pass
 
-        context.close(); browser.close()
+        except Exception as e:
+            print("[scrape] error:", e)
+            traceback.print_exc()
+            try:
+                page.screenshot(path=debug_screenshot, full_page=True)
+            except Exception:
+                pass
+        finally:
+            context.close()
+            browser.close()
 
-    # normalize hrefs
-    final=[]
-    for it in json_products:
-        href = it.get("href")
-        if href and href.startswith("/"):
-            href = urljoin(SHEIN_URL, href)
-        final.append({"id": it["id"], "title": it["title"], "href": href or SHEIN_URL, "in_stock": bool(it["in_stock"])})
+    return results
 
-    return final
+# ── Business logic
+def build_alerts(items: list[dict], cache: dict):
+    """
+    Decide which items to alert per ALERT_MODE.
+    Returns: (notifications, updated_cache)
+    """
+    notifications = []
+    for it in items:
+        prev = cache.get(it["id"])
 
-# ----------------- Periodic + Alerts -----------------
-def run_check():
+        if ALERT_MODE == "new_only":
+            # alert for brand-new items that are currently in stock
+            if prev is None and it["oos"] is False:
+                notifications.append(it)
+        else:
+            # fallback: alert if in stock and was unseen or previously OOS
+            if it["oos"] is False and (prev is None or (prev and prev.get("oos") is True)):
+                notifications.append(it)
+
+        # always update cache
+        cache[it["id"]] = {"oos": it["oos"], "title": it["title"], "href": it["href"]}
+
+    return notifications, cache
+
+def notify(notifications: list[dict], chat_id: str | None = None):
+    if not notifications:
+        send_telegram("No items are in stock right now.", chat_id=chat_id)
+        return
+    lines = ["🟢 <b>SHEIN new stock alert</b>:"]
+    for n in notifications[:50]:  # guard against huge spam
+        lines.append(f"• {n['title']} — <b>In stock</b>\n{n['href']}")
+    send_telegram("\n".join(lines), chat_id=chat_id)
+
+def check_now(chat_id: str | None = None, clear_cache: bool = False):
+    if clear_cache and CACHE_PATH.exists():
+        try:
+            CACHE_PATH.unlink()
+        except Exception:
+            pass
+
+    cache = load_cache()
     items = scrape_once()
-    prev  = load_cache()
-    cur   = {i["id"]: {"in_stock": i["in_stock"], "title": i["title"], "href": i["href"]} for i in items}
-    alerts = decide_alerts(prev, cur)
-    save_cache(cur)
+    total = len(items)
+    instock = sum(1 for x in items if not x["oos"])
 
-    if VERBOSE:
-        print(f"[debug] total={len(items)} instock={sum(1 for v in cur.values() if v['in_stock'])} alerts={len(alerts)}")
+    # If no products were parsed at all, hint blocking
+    if total == 0:
+        send_telegram(
+            "⚠️ I couldn’t read the products (possibly blocked). "
+            "I saved <code>debug.png</code> in the app folder. "
+            "Open the Railway shell and run:\n\n"
+            "<code>ls -l debug.png</code>\n"
+            "Then download it with:\n"
+            "<code>cat debug.png</code> (copy via your terminal) or use SFTP.",
+            chat_id=chat_id,
+        )
+        return
 
-    if alerts and CHAT_ID:
-        lines = ["🟢 SHEIN stock alert:"]
-        for a in alerts:
-            lines.append(f"• {a['title']} — In stock\n{a['href']}")
-        send_text(CHAT_ID, "\n".join(lines), reply_markup=menu_markup())
-    return items
+    notifications, new_cache = build_alerts(items, cache)
+    save_cache(new_cache)
 
-# ----------------- Telegram bot (polling + buttons) -----------------
-def handle_update(upd):
-    if "message" in upd:
-        m   = upd["message"]
-        chat= m["chat"]["id"]
-        txt = (m.get("text") or "").strip().lower()
-        if txt == "/start":
-            send_text(chat, "Welcome! Use the buttons below to check stock or refresh.", reply_markup=menu_markup())
-        elif txt in ("/check","/refresh"):
-            send_text(chat, "⏳ Checking current stock…")
-            items = scrape_once()
-            send_text(chat, summarize_instock(items), reply_markup=menu_markup())
+    # summary first
+    send_telegram(f"🔎 Parsed <b>{total}</b> products. In stock: <b>{instock}</b>.", chat_id=chat_id)
+    # then alerts if any
+    if notifications:
+        notify(notifications, chat_id=chat_id)
+    else:
+        send_telegram("No brand-new in-stock items to alert right now.", chat_id=chat_id)
 
-    if "callback_query" in upd:
-        cq   = upd["callback_query"]
-        cid  = cq["id"]
-        data = cq.get("data","")
-        chat = cq["message"]["chat"]["id"]
-        mid  = cq["message"]["message_id"]
-        answer_cbq(cid)
-        if data in ("check","refresh"):
-            tg("editMessageText", chat_id=chat, message_id=mid, text="⏳ Loading latest stock…")
-            items = scrape_once()
-            tg("editMessageText", chat_id=chat, message_id=mid,
-               text=summarize_instock(items), reply_markup=menu_markup())
-
-def poll_loop():
-    offset=None
-    while True:
-        try:
-            r = requests.get(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
-                params={"timeout": 50, **({"offset": offset} if offset else {})},
-                timeout=60
-            )
-            js = r.json()
-            for u in js.get("result", []):
-                offset = u["update_id"] + 1
-                handle_update(u)
-        except Exception as e:
-            print("[warn] poll:", e)
-            time.sleep(3)
-
+# ── Main loop: handle Telegram buttons + periodic scans
 def main():
-    print("[bot] started")
-    last = 0
+    print("[bot] starting loop...")
+    if not BOT_TOKEN:
+        print("ERROR: TELEGRAM_BOT_TOKEN is required.")
+    last_update_id = None
+    last_scan_ts = 0
+
+    # Send a one-time “started” ping
+    try:
+        if CHAT_ID:
+            send_menu(CHAT_ID)
+            send_telegram("✅ Bot started.", chat_id=CHAT_ID)
+    except Exception:
+        pass
+
     while True:
-        try:
-            if time.time() - last >= CHECK_EVERY:
-                run_check()
-                last = time.time()
-            poll_loop()
-        except Exception as e:
-            print("[warn] main:", e)
-            time.sleep(3)
+        # 1) Handle Telegram updates (buttons + /start)
+        updates = tg_get_updates(last_update_id + 1 if last_update_id else None)
+        for upd in updates:
+            last_update_id = upd["update_id"]
+
+            # Button press
+            if "callback_query" in upd:
+                cq = upd["callback_query"]
+                cb_id = cq.get("id")
+                from_chat = str(cq["from"]["id"])
+                data = cq.get("data")
+
+                if data == "check":
+                    answer_callback(cb_id, "Checking now…")
+                    check_now(chat_id=from_chat, clear_cache=False)
+                    send_menu(from_chat)
+                elif data == "refresh":
+                    answer_callback(cb_id, "Refreshing…")
+                    check_now(chat_id=from_chat, clear_cache=True)
+                    send_menu(from_chat)
+                else:
+                    answer_callback(cb_id, "Unknown action")
+
+            # /start or normal message
+            elif "message" in upd:
+                msg = upd["message"]
+                text = (msg.get("text") or "").strip().lower()
+                from_chat = str(msg["chat"]["id"])
+
+                if text == "/start":
+                    send_telegram("Hi! I can watch SHEIN stock. Use the buttons below.", chat_id=from_chat)
+                    send_menu(from_chat)
+                elif text in ("/check", "check"):
+                    check_now(chat_id=from_chat, clear_cache=False)
+                elif text in ("/refresh", "refresh"):
+                    check_now(chat_id=from_chat, clear_cache=True)
+                else:
+                    send_menu(from_chat)
+
+        # 2) Periodic auto-scan (alerts to default CHAT_ID if set)
+        now = time.time()
+        if now - last_scan_ts > SCAN_INTERVAL_MIN * 60:
+            print("[bot] auto-scan…")
+            try:
+                cache = load_cache()
+                items = scrape_once()
+                notifications, new_cache = build_alerts(items, cache)
+                save_cache(new_cache)
+                if notifications and CHAT_ID:
+                    notify(notifications, chat_id=CHAT_ID)
+                print(f"[debug] total={len(items)} instock={sum(1 for x in items if not x['oos'])} alerts={len(notifications)}")
+            except Exception as e:
+                print("[scan] error:", e)
+            last_scan_ts = now
+
+        time.sleep(2)
 
 if __name__ == "__main__":
     main()
